@@ -87,12 +87,16 @@ $script:Apps = @(
         Name       = 'Blender'
         Port       = 8001
         Venv       = 'blender-mcp-env'
-        # blender-mcp переименован в mcp-for-blender; старое имя работает как alias
-        Packages   = @('blender-mcp')
-        ServerExe  = @('blender-mcp.exe', 'mcp-for-blender.exe')
+        # официальный MCP-сервер Blender Lab (projects.blender.org/lab/blender_mcp),
+        # ставится из git — нужен Git for Windows. Community-альтернатива с PyPI
+        # (ahujasid, 'blender-mcp') использует другой протокол и НЕ совместима
+        # с официальным аддоном из Blender 5.1+.
+        Packages   = @('git+https://projects.blender.org/lab/blender_mcp.git#subdirectory=mcp')
+        NeedsGit   = $true
+        ServerExe  = @('blender-mcp.exe')
         Env        = @{}
         Upstream   = @{ Kind = 'tcp'; Host = '127.0.0.1'; Port = 9876; Label = 'Blender addon' }
-        Hint       = 'В Blender: Edit > Preferences > Add-ons включи "MCP for Blender", затем в 3D-вьюпорте (N) на вкладке MCP нажми Start MCP Server. Аддон: uvx blender-mcp install-addon'
+        Hint       = 'В Blender: Edit > Preferences > System > Network включи Allow Online Access, затем Add-ons > MCP > Start MCP Bridge Server (или включи Auto Start).'
         PostSetup  = {}
     }
 )
@@ -256,6 +260,12 @@ function Invoke-Setup {
 
         foreach ($app in $script:Apps) {
             Write-Host "`n  --- $($app.Name) ($($app.Venv)) ---" -ForegroundColor White
+            if ($app.NeedsGit -and -not $script:GitOk) {
+                Write-Host '  Пропущено: для установки нужен Git for Windows (https://git-scm.com/install/windows).' -ForegroundColor Yellow
+                Write-Host '  Поставь Git и запусти setup ещё раз.' -ForegroundColor Yellow
+                $script:SetupErrors += "$($app.Name) (нет Git)"
+                continue
+            }
             try {
                 $venvDir = Join-Path $cfg.BaseDir $app.Venv
                 $py = Join-Path $venvDir 'Scripts\python.exe'

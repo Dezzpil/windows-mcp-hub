@@ -76,24 +76,36 @@ powershell -ExecutionPolicy Bypass -File .\mcp-hub.ps1 setup
 - Три раздельных venv (конфликт версий пакета `mcp` не даёт держать всё
   в одном окружении):
   - `comfy-mcp-env` — `comfy-mcp` + `comfy-cli`;
-  - `blender-mcp-env` — `blender-mcp` (сейчас называется `mcp-for-blender`);
+  - `blender-mcp-env` — официальный MCP-сервер Blender Lab из git;
   - `mcp-proxy-env` — `mcp-proxy`.
 - `comfy-cli` настраивается на существующую установку ComfyUI
   (`comfy set-default`), новая установка не создаётся.
 - `mcp-proxy` превращает локальные stdio MCP-серверы в HTTP-эндпоинты
   локальной сети: ComfyUI — порт 8000, Blender — 8001.
 
-## Blender: ручной шаг
+## Blender: ручные шаги в самом Blender
 
-Аддон нельзя поставить за тебя — в Blender:
+mcp-hub ставит официальный MCP-сервер [Blender Lab](https://projects.blender.org/lab/blender_mcp)
+(из git-репозитория, поэтому для Blender нужен Git for Windows). Аддон
+в Blender ставится и запускается руками:
 
-1. `uvx blender-mcp install-addon` (или скачай `addon.py` из репозитория
-   ahujasid/mcp-for-blender).
-2. Edit → Preferences → Add-ons → включи **MCP for Blender**.
-3. В 3D-вьюпорте нажми `N` → вкладка MCP → **Start MCP Server**
-   (аддон слушает `localhost:9876`).
+1. **Аддон**: Blender 5.1+ → Edit → Preferences → Get Extensions →
+   найди **MCP** (Blender Lab) → Install. Либо скачай zip со страницы
+   [blender.org/lab/mcp-server](https://www.blender.org/lab/mcp-server/)
+   и установи через Install from Disk.
+2. **Разрешение сети**: Edit → Preferences → **System → Network →
+   Allow Online Access**. Без этого кнопка запуска выдаёт
+   «Online access must be enabled in the system preferences» — аддон
+   открывает порт только на этом же компьютере, но правило Blender
+   требует включить переключатель.
+3. **Запуск**: Edit → Preferences → Add-ons → **MCP** → **Start MCP
+   Bridge Server**. Статус должен смениться на «Server is running».
+   Галочка **Auto Start** запускает сервер автоматически при старте
+   Blender. Аддон слушает `localhost:9876`.
 
-`status` напомнит об этом, если порт 9876 не отвечает.
+Важно: не ставь community-аддон ahujasid (BlenderMCP / MCP for
+Blender) вместе с официальным — оба используют порт 9876, но говорят
+на разных протоколах. Если он был установлен раньше — отключи его.
 
 ## Пример вывода status
 
