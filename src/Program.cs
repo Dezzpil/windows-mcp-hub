@@ -26,6 +26,8 @@ namespace McpHub
     {
         static int Main(string[] args)
         {
+            // запуск без аргументов = двойной клик: окно не должно закрываться сразу
+            bool interactive = args.Length == 0;
             Assembly asm = Assembly.GetExecutingAssembly();
             string script;
             using (Stream s = asm.GetManifestResourceStream("mcp-hub.ps1"))
@@ -71,15 +73,25 @@ namespace McpHub
                 catch (Exception e)
                 {
                     Console.Error.WriteLine("Не удалось запустить PowerShell (" + ps + "): " + e.Message);
+                    Pause(interactive);
                     return 1;
                 }
                 p.WaitForExit();
+                Pause(interactive);
                 return p.ExitCode;
             }
             finally
             {
                 try { File.Delete(tmp); } catch (IOException) { }
             }
+        }
+
+        static void Pause(bool interactive)
+        {
+            if (!interactive) return;
+            Console.WriteLine();
+            Console.Write("Нажмите Enter, чтобы закрыть...");
+            try { Console.ReadLine(); } catch (IOException) { }
         }
 
         static string QuoteArgs(string[] args)

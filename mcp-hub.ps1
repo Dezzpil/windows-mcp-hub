@@ -17,7 +17,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [string]$Command = 'status',
+    [string]$Command = 'auto',
 
     [Parameter(Position = 1)]
     [string]$AppName
@@ -70,7 +70,11 @@ $script:Apps = @(
         Upstream   = @{ Kind = 'http'; Url = 'http://127.0.0.1:8188/system_stats'; Label = 'ComfyUI API' }
         Hint       = 'Запусти ComfyUI (Desktop) и проверь, что порт совпадает с ComfyUrl в конфиге.'
         PostSetup  = {
-            # указываем comfy-cli на существующую установку ComfyUI
+            # указываем comfy-cli на существующую установку ComfyUI (нужен Git)
+            if (-not $script:GitOk) {
+                Write-Host '  comfy set-default пропущен (нет Git)' -ForegroundColor DarkGray
+                return
+            }
             $comfyExe = Join-Path $cfg.BaseDir 'comfy-mcp-env\Scripts\comfy.exe'
             if (Test-Path $comfyExe) {
                 Write-Host "  -> comfy set-default $($cfg.ComfyWorkspace)"
@@ -101,7 +105,9 @@ $script:ProxyVenv = 'mcp-proxy-env'
 # ----------------------------------------------------------------------------
 
 function Read-HubConfig {
-    if (Test-Path $ConfigFile) {
+    $existed = Test-Path $ConfigFile
+    $map = $null
+    if ($existed) {
         try {
             $cfg = Get-Content $ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
             $map = @{}
@@ -112,12 +118,20 @@ function Read-HubConfig {
                     $map[$k] = $script:Defaults[$k]
                 }
             }
-            return $map
         } catch {
             Write-Warning "Не удалось прочитать $ConfigFile ($($_.Exception.Message)). Использую значения по умолчанию."
         }
     }
-    return $script:Defaults.Clone()
+    if (-not $map) { $map = $script:Defaults.Clone() }
+
+    # при первом запуске сразу создаём json и определяем LAN IP,
+    # чтобы конфиг существовал после любой команды
+    if (-not $existed) {
+        if (-not $map.ServerIp) { $map.ServerIp = Get-LanIp }
+        if (-not $map.ServerIp) { $map.ServerIp = '127.0.0.1' }
+        Save-HubConfig $map
+    }
+    return $map
 }
 
 function Save-HubConfig($cfg) {
@@ -126,14 +140,21 @@ function Save-HubConfig($cfg) {
 }
 
 function Get-LanIp {
-    $ip = (Get-NetIPConfiguration -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
-        Select-Object -First 1).IPv4Address.IPAddress
+    # никогда не бросает исключение: не смогли определить — вернём 127.0.0.1
+    $ip = $null
+    try {
+        $ip = (Get-NetIPConfiguration -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
+            Select-Object -First 1).IPv4Address.IPAddress
+    } catch {}
     if (-not $ip) {
-        $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
-            Select-Object -First 1).IPAddress
+        try {
+            $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+                Select-Object -First 1).IPAddress
+        } catch {}
     }
+    if (-not $ip) { $ip = '127.0.0.1' }
     return $ip
 }
 
@@ -196,71 +217,95 @@ function Invoke-Setup {
 
     Write-Host ''
     Write-Host '=== MCP Hub: установка ===' -ForegroundColor Cyan
+    $script:SetupErrors = @()
 
-    # 1. Git
+    # 1. Git (нужен только comfy-cli для set-default — без него продолжаем)
     Write-Host "`n[1/4] Проверяю Git" -ForegroundColor Yellow
-    $gitOk = $false
-    try { git --version *> $null; $gitOk = $true } catch {}
-    if (-not $gitOk -and (Test-Path $cfg.GitExe)) {
+    $script:GitOk = $false
+    try { git --version *> $null; $script:GitOk = $true } catch {}
+    if (-not $script:GitOk -and (Test-Path $cfg.GitExe)) {
         $env:GIT_PYTHON_GIT_EXECUTABLE = $cfg.GitExe
-        try { & $cfg.GitExe --version *> $null; $gitOk = $true } catch {}
+        try { & $cfg.GitExe --version *> $null; $script:GitOk = $true } catch {}
     }
-    if ($gitOk) { Write-Host '  Git найден' -ForegroundColor Green }
+    if ($script:GitOk) { Write-Host '  Git найден' -ForegroundColor Green }
     else {
-        Write-Host '  Git НЕ найден. Установи Git for Windows (https://git-scm.com/install/windows)' -ForegroundColor Red
-        Write-Host '  и повтори setup.' -ForegroundColor Red
-        return
+        Write-Host '  Git НЕ найден — шаг comfy set-default будет пропущен.' -ForegroundColor Yellow
+        Write-Host '  Чтобы убрать это предупреждение, установи Git for Windows: https://git-scm.com/install/windows' -ForegroundColor DarkGray
     }
 
     # 2. Базовый Python (из venv ComfyUI)
     Write-Host "`n[2/4] Проверяю базовый Python" -ForegroundColor Yellow
-    if (-not (Test-Path $cfg.BasePython)) {
-        Write-Host "  Не найден: $($cfg.BasePython)" -ForegroundColor Red
-        Write-Host '  Укажи правильный путь в BasePython внутри mcp-hub.config.json и повтори setup.'
-        return
+    $pythonOk = Test-Path $cfg.BasePython
+    if ($pythonOk) {
+        Write-Host "  OK: $($cfg.BasePython)" -ForegroundColor Green
+    } else {
+        Write-Host "  НЕ найден: $($cfg.BasePython)" -ForegroundColor Red
+        Write-Host '  Окружения создать не получится. Открой mcp-hub.config.json,'
+        Write-Host '  укажи в BasePython путь к python.exe из venv ComfyUI (или любой'
+        Write-Host '  Python 3.10+) и запусти setup ещё раз.' -ForegroundColor Yellow
+        $script:SetupErrors += 'базовый Python'
     }
-    Write-Host "  OK: $($cfg.BasePython)" -ForegroundColor Green
 
     # 3. Определяем LAN IP
     if (-not $cfg.ServerIp) { $cfg.ServerIp = Get-LanIp }
     if (-not $cfg.ServerIp) { $cfg.ServerIp = '127.0.0.1' }
 
-    # 4. Окружения
-    Write-Host "`n[3/4] Создаю окружения в $($cfg.BaseDir)" -ForegroundColor Yellow
+    # 4. Окружения — каждое в своём try/catch: упавшее не рушит остальные
+    if ($pythonOk) {
+        Write-Host "`n[3/4] Создаю окружения в $($cfg.BaseDir)" -ForegroundColor Yellow
 
-    foreach ($app in $script:Apps) {
-        Write-Host "`n  --- $($app.Name) ($($app.Venv)) ---" -ForegroundColor White
-        $venvDir = Join-Path $cfg.BaseDir $app.Venv
-        $py = Join-Path $venvDir 'Scripts\python.exe'
+        foreach ($app in $script:Apps) {
+            Write-Host "`n  --- $($app.Name) ($($app.Venv)) ---" -ForegroundColor White
+            try {
+                $venvDir = Join-Path $cfg.BaseDir $app.Venv
+                $py = Join-Path $venvDir 'Scripts\python.exe'
 
-        if (-not (Test-Path $py)) {
-            Write-Host "  Создаю venv: $venvDir"
-            & $cfg.BasePython -m venv $venvDir
-            if ($LASTEXITCODE -ne 0) { Write-Host '  ОШИБКА создания venv' -ForegroundColor Red; continue }
+                if (-not (Test-Path $py)) {
+                    Write-Host "  Создаю venv: $venvDir"
+                    & $cfg.BasePython -m venv $venvDir
+                    if ($LASTEXITCODE -ne 0) { throw "не удалось создать venv: $venvDir" }
+                }
+                Write-Host "  Устанавливаю пакеты: $($app.Packages -join ', ')"
+                & $py -m pip install --upgrade pip | Out-Null
+                & $py -m pip install $app.Packages
+                if ($LASTEXITCODE -ne 0) { throw "pip install не удался для $($app.Name)" }
+                & $py -m pip check
+                if ($app.PostSetup) { & $app.PostSetup }
+            } catch {
+                Write-Host "  ОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host '  Остальные приложения продолжают устанавливаться.' -ForegroundColor DarkGray
+                $script:SetupErrors += $app.Name
+            }
         }
-        Write-Host "  Устанавливаю пакеты: $($app.Packages -join ', ')"
-        & $py -m pip install --upgrade pip | Out-Null
-        & $py -m pip install $app.Packages
-        & $py -m pip check
-        if ($app.PostSetup) { & $app.PostSetup }
+
+        # общий venv с mcp-proxy
+        Write-Host "`n  --- mcp-proxy ($script:ProxyVenv) ---" -ForegroundColor White
+        try {
+            $proxyDir = Join-Path $cfg.BaseDir $script:ProxyVenv
+            $proxyPy = Join-Path $proxyDir 'Scripts\python.exe'
+            if (-not (Test-Path $proxyPy)) {
+                Write-Host "  Создаю venv: $proxyDir"
+                & $cfg.BasePython -m venv $proxyDir
+            }
+            & $proxyPy -m pip install --upgrade pip | Out-Null
+            & $proxyPy -m pip install mcp-proxy
+            if ($LASTEXITCODE -ne 0) { throw 'pip install mcp-proxy не удался' }
+            & $proxyPy -m pip check
+        } catch {
+            Write-Host "  ОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+            $script:SetupErrors += 'mcp-proxy'
+        }
+    } else {
+        Write-Host "`n[3/4] Создание окружений пропущено (нет базового Python)" -ForegroundColor Yellow
     }
 
-    # общий venv с mcp-proxy
-    Write-Host "`n  --- mcp-proxy ($script:ProxyVenv) ---" -ForegroundColor White
-    $proxyDir = Join-Path $cfg.BaseDir $script:ProxyVenv
-    $proxyPy = Join-Path $proxyDir 'Scripts\python.exe'
-    if (-not (Test-Path $proxyPy)) {
-        Write-Host "  Создаю venv: $proxyDir"
-        & $cfg.BasePython -m venv $proxyDir
-    }
-    & $proxyPy -m pip install --upgrade pip | Out-Null
-    & $proxyPy -m pip install mcp-proxy
-    & $proxyPy -m pip check
-
-    # 5. Сохраняем конфиг
+    # 5. Сохраняем конфиг в любом случае
     Save-HubConfig $cfg
 
-    Write-Host "`n[4/4] Готово" -ForegroundColor Green
+    Write-Host "`n[4/4] Установка завершена" -ForegroundColor Green
+    if ($script:SetupErrors.Count -gt 0) {
+        Write-Host "  Не удалось: $(($script:SetupErrors) -join ', '). Исправь и запусти setup ещё раз." -ForegroundColor Yellow
+    }
     Write-Host ''
     Write-Host "Дальше:" -ForegroundColor Cyan
     Write-Host "  1) запусти приложения (ComfyUI Desktop, Blender + Start MCP Server)"
@@ -281,9 +326,12 @@ function Invoke-Setup {
 function Invoke-Start {
     $cfg = Read-HubConfig
     $apps = Select-App $AppName
-    $proxyExe = Join-Path (Join-Path $cfg.BaseDir $script:ProxyVenv) 'Scripts\mcp-proxy.exe'
-    if (-not (Test-Path $proxyExe)) {
-        throw "mcp-proxy не найден: $proxyExe. Сначала выполни: .\mcp-hub.ps1 setup"
+    $proxyExe = $null
+    try { $proxyExe = Join-Path (Join-Path $cfg.BaseDir $script:ProxyVenv) 'Scripts\mcp-proxy.exe' } catch {}
+    if (-not $proxyExe -or -not (Test-Path $proxyExe)) {
+        Write-Host "mcp-proxy не найден в $($cfg.BaseDir)\$($script:ProxyVenv)" -ForegroundColor Red
+        Write-Host "Сначала выполни установку: .\mcp-hub.ps1 setup" -ForegroundColor Yellow
+        return
     }
     if (-not $cfg.ServerIp) { $cfg.ServerIp = Get-LanIp; Save-HubConfig $cfg }
 
@@ -363,27 +411,31 @@ function Invoke-Status {
     foreach ($app in $script:Apps) {
         Write-Host ''
         Write-Host ('  ' + $app.Name) -ForegroundColor White
-        $url = "http://${ip}:$($app.Port)/mcp"
+        try {
+            $url = "http://${ip}:$($app.Port)/mcp"
 
-        # прокси
-        $pid_ = Get-PortOwnerPid -Port $app.Port
-        Write-Host ('    MCP endpoint    {0,-45}' -f $url) -NoNewline
-        if ($pid_) {
-            Write-Mark $true; Write-Host "прокси запущен (PID $pid_)"
-        } else {
-            Write-Mark $false; Write-Host "не запущен  ->  .\mcp-hub.ps1 start $($app.Id)"
-        }
+            # прокси
+            $pid_ = Get-PortOwnerPid -Port $app.Port
+            Write-Host ('    MCP endpoint    {0,-45}' -f $url) -NoNewline
+            if ($pid_) {
+                Write-Mark $true; Write-Host "прокси запущен (PID $pid_)"
+            } else {
+                Write-Mark $false; Write-Host "не запущен  ->  .\mcp-hub.ps1 start $($app.Id)"
+            }
 
-        # upstream
-        $up = $app.Upstream
-        Write-Host ('    {0,-17} {1,-45}' -f $up.Label, ($(if ($up.Kind -eq 'http') { $up.Url } else { "$($up.Host):$($up.Port)" }))) -NoNewline
-        $upOk = $false
-        if ($up.Kind -eq 'http') { $upOk = Test-HttpStatus -Url $up.Url }
-        else { $upOk = Test-TcpPort -Ip $up.Host -Port $up.Port }
-        if ($upOk) { Write-Mark $true; Write-Host 'отвечает' }
-        else {
-            Write-Mark $false; Write-Host 'недоступен'
-            Write-Host "      Подсказка: $($app.Hint)" -ForegroundColor DarkYellow
+            # upstream
+            $up = $app.Upstream
+            Write-Host ('    {0,-17} {1,-45}' -f $up.Label, ($(if ($up.Kind -eq 'http') { $up.Url } else { "$($up.Host):$($up.Port)" }))) -NoNewline
+            $upOk = $false
+            if ($up.Kind -eq 'http') { $upOk = Test-HttpStatus -Url $up.Url }
+            else { $upOk = Test-TcpPort -Ip $up.Host -Port $up.Port }
+            if ($upOk) { Write-Mark $true; Write-Host 'отвечает' }
+            else {
+                Write-Mark $false; Write-Host 'недоступен'
+                Write-Host "      Подсказка: $($app.Hint)" -ForegroundColor DarkYellow
+            }
+        } catch {
+            Write-Host "    Ошибка проверки: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 
@@ -459,10 +511,41 @@ function Invoke-Config {
 }
 
 # ----------------------------------------------------------------------------
+#  AUTO — запуск без аргументов: сделать всё, что возможно
+# ----------------------------------------------------------------------------
+
+function Invoke-Auto {
+    $cfg = Read-HubConfig
+
+    # если окружений ещё нет — сначала установка
+    $needSetup = $true
+    try {
+        $needSetup = -not (Test-Path (Join-Path (Join-Path $cfg.BaseDir $script:ProxyVenv) 'Scripts\mcp-proxy.exe'))
+        if (-not $needSetup) {
+            foreach ($app in $script:Apps) {
+                if (-not (Get-AppServerExe $app $cfg)) { $needSetup = $true; break }
+            }
+        }
+    } catch { $needSetup = $true }
+    if ($needSetup) {
+        Write-Host ''
+        Write-Host 'Окружения не найдены — сначала установка...' -ForegroundColor Yellow
+        Invoke-Setup
+    }
+
+    # запуск прокси для всех приложений
+    Invoke-Start
+
+    # и наглядный итог
+    Invoke-Status
+}
+
+# ----------------------------------------------------------------------------
 #  DISPATCH
 # ----------------------------------------------------------------------------
 
 switch ($Command.ToLower()) {
+    'auto'   { Invoke-Auto }
     'setup'  { Invoke-Setup }
     'start'  { Invoke-Start }
     'stop'   { Invoke-Stop }
@@ -472,6 +555,7 @@ switch ($Command.ToLower()) {
         Write-Host ''
         Write-Host 'MCP Hub — управление MCP-серверами (ComfyUI, Blender, ...)' -ForegroundColor Cyan
         Write-Host ''
+        Write-Host '  .\mcp-hub.ps1                   авто: установка если надо + запуск + статус'
         Write-Host '  .\mcp-hub.ps1 setup            установка и настройка всего'
         Write-Host '  .\mcp-hub.ps1 start [app]       запуск прокси (comfyui | blender | все)'
         Write-Host '  .\mcp-hub.ps1 stop  [app]       остановка'
