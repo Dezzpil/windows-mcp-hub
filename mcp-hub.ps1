@@ -40,8 +40,13 @@ $script:Defaults = @{
     BasePython     = 'D:\Comfy-Desktop\ComfyUI-Installs\ComfyUI\ComfyUI\.venv\Scripts\python.exe'
     GitExe         = 'C:\Program Files\Git\cmd\git.exe'
     ComfyUrl       = 'http://127.0.0.1:8188'
-    ServerIp       = ''      # определяется автоматически при setup
+    ServerIp       = ''      # LAN IP — определяется автоматически
+    TailscaleIp    = ''      # IP в tailnet (100.x.y.z) — определяется автоматически, если стоит Tailscale
     ClientIp       = ''      # IP компьютера с Claude Desktop — для подсказки про firewall
+    BindAll        = $true   # слушать все интерфейсы (нужно для LAN + Tailscale одновременно)
+    AllowedHosts   = @()     # дополнительные Host-авторитеты для mcp-proxy (имена/IP без порта или с портом)
+    AuthToken      = ''      # Bearer-токен для входящих подключений; генерируется автоматически
+    NoAuth         = $false  # $true = отключить проверку токена (не рекомендуется)
 }
 
 # ----------------------------------------------------------------------------
@@ -160,6 +165,26 @@ function Get-LanIp {
     }
     if (-not $ip) { $ip = '127.0.0.1' }
     return $ip
+}
+
+function Get-TailscaleIp {
+    # Tailscale-адреса всегда из диапазона 100.64.0.0/10 (CGNAT)
+    $tsPath = $null
+    $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
+    if ($cmd) { $tsPath = $cmd.Source }
+    elseif (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') { $tsPath = 'C:\Program Files\Tailscale\tailscale.exe' }
+    if (-not $tsPath) { return $null }
+    try {
+        $out = & $tsPath ip -4 2>$null
+        return ($out | Where-Object { $_ -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$' } | Select-Object -First 1)
+    } catch { return $null }
+}
+
+function New-AuthToken {
+    $bytes = New-Object byte[] 24
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
 function Test-TcpPort {
@@ -344,6 +369,25 @@ function Invoke-Start {
         return
     }
     if (-not $cfg.ServerIp) { $cfg.ServerIp = Get-LanIp; Save-HubConfig $cfg }
+    if (-not $cfg.TailscaleIp) {
+        $cfg.TailscaleIp = Get-TailscaleIp
+        if ($cfg.TailscaleIp) { Save-HubConfig $cfg }
+    }
+    if ($cfg.TailscaleIp) {
+        Write-Host "Tailscale: $($cfg.TailscaleIp)" -ForegroundColor DarkGray
+    }
+
+    # Bearer-токен для входящих подключений (генерируется один раз)
+    if (-not $cfg.AuthToken -and -not $cfg.NoAuth) {
+        $cfg.AuthToken = New-AuthToken
+        Save-HubConfig $cfg
+        Write-Host 'Сгенерирован Bearer-токен (AuthToken в mcp-hub.config.json).' -ForegroundColor Yellow
+        Write-Host 'Конфиг для клиента с токеном печатает: .\mcp-hub.ps1 config' -ForegroundColor Yellow
+    }
+    if ($cfg.AuthToken) {
+        # прокси проверяет токен сам; дочерним MCP-серверам он не передаётся
+        $env:MCP_PROXY_AUTH_TOKEN = $cfg.AuthToken
+    }
 
     foreach ($app in $apps) {
         Write-Host ''
@@ -366,12 +410,30 @@ function Invoke-Start {
             $env:COMFY_LOCAL_URL = $cfg.ComfyUrl
         }
 
-        $host_ = $cfg.ServerIp
-        $allowedHost = "$($host_):$($app.Port)"
-        Write-Host "  Запускаю mcp-proxy на ${host_}:$($app.Port) -> $serverExe"
+        # интерфейс биндинга и разрешённые Host-авторитеты.
+        # 0.0.0.0 нужен, чтобы прокси отвечал и в LAN, и в tailnet одновременно;
+        # при wildcard-биндинге mcp-proxy требует явный список allowed-host.
+        $bindHost = $cfg.ServerIp
+        $hostArgs = @()
+        if ($cfg.BindAll) {
+            $bindHost = '0.0.0.0'
+            $auths = @("$($cfg.ServerIp):$($app.Port)")
+            if ($cfg.TailscaleIp) { $auths += "$($cfg.TailscaleIp):$($app.Port)" }
+            if ($cfg.AllowedHosts) {
+                foreach ($h in $cfg.AllowedHosts) {
+                    if ($h -match ':') { $auths += $h } else { $auths += "$($h):$($app.Port)" }
+                }
+            }
+            foreach ($ha in ($auths | Select-Object -Unique)) {
+                $hostArgs += @('--allowed-host', $ha)
+            }
+        } else {
+            $hostArgs = @('--allowed-host', "$($cfg.ServerIp):$($app.Port)")
+        }
+        Write-Host "  Запускаю mcp-proxy на ${bindHost}:$($app.Port) -> $serverExe"
 
         $proc = Start-Process -FilePath $proxyExe `
-            -ArgumentList @('--host', $host_, '--port', "$($app.Port)", '--allowed-host', $allowedHost, '--pass-environment', '--', $serverExe) `
+            -ArgumentList (@('--host', $bindHost, '--port', "$($app.Port)") + $hostArgs + @('--pass-environment', '--', $serverExe)) `
             -WindowStyle Minimized -PassThru
 
         # ждём порт
@@ -382,7 +444,10 @@ function Invoke-Start {
             if ($proc.HasExited) { break }
         }
         if ($ready) {
-            Write-Host "  OK: http://${host_}:$($app.Port)/mcp  (PID $($proc.Id))" -ForegroundColor Green
+            Write-Host "  OK: http://$($cfg.ServerIp):$($app.Port)/mcp  (PID $($proc.Id))" -ForegroundColor Green
+            if ($cfg.TailscaleIp) {
+                Write-Host "      Tailscale: http://$($cfg.TailscaleIp):$($app.Port)/mcp" -ForegroundColor Green
+            }
         } else {
             Write-Host "  Прокси не поднялся на порту $($app.Port). Открой свернутое окно mcp-proxy и посмотри ошибки." -ForegroundColor Red
         }
@@ -453,13 +518,24 @@ function Invoke-Status {
     Write-Host '--------------------------------------------------' -ForegroundColor DarkGray
     Write-Host '  Подключение клиента (Claude Desktop и т.п.):' -ForegroundColor Cyan
     foreach ($app in $script:Apps) {
-        Write-Host "    $($app.Name):  http://${ip}:$($app.Port)/mcp"
+        Write-Host "    LAN         $($app.Name):  http://${ip}:$($app.Port)/mcp"
     }
+    if ($cfg.TailscaleIp) {
+        Write-Host "  Внешний доступ (Tailscale):" -ForegroundColor Cyan
+        foreach ($app in $script:Apps) {
+            Write-Host "    Tailscale   $($app.Name):  http://$($cfg.TailscaleIp):$($app.Port)/mcp"
+        }
+    } else {
+        Write-Host '  Tailscale не обнаружен (ставится с tailscale.com — тогда доступ будет откуда угодно)' -ForegroundColor DarkGray
+    }
+    $authState = if ($cfg.AuthToken) { 'Bearer-токен задан' } else { 'выключен (NoAuth)' }
+    Write-Host "  Аутентификация: $authState"
     Write-Host '  Готовые конфиги:  .\mcp-hub.ps1 config'
     if ($cfg.ClientIp) {
-        Write-Host "  Firewall: разрешите порты только с $($cfg.ClientIp) (команды в выводе setup/config)"
+        Write-Host "  Firewall (для LAN): разрешите порты только с $($cfg.ClientIp) (команды в выводе setup/config)"
     } else {
-        Write-Host '  Firewall: открывай порты только для IP клиента, не для всей сети' -ForegroundColor DarkGray
+        Write-Host '  Firewall (для LAN): открывай порты только для IP клиента' -ForegroundColor DarkGray
+        Write-Host '  Для Tailscale правила firewall не нужны — трафик идёт через защищённый туннель' -ForegroundColor DarkGray
     }
     Write-Host ''
 }
@@ -478,17 +554,32 @@ function Invoke-Config {
     Write-Host '================ Как подключиться ================' -ForegroundColor Cyan
 
     # --- вариант 1: Claude Desktop на ДРУГОМ компьютере (Linux/Windows) ---
+    # при наличии Tailscale используем tailnet-адрес: работает откуда угодно
+    $clientIp = $cfg.TailscaleIp
+    if (-not $clientIp) { $clientIp = $ip }
+    $viaTs = [bool]$cfg.TailscaleIp
+
     Write-Host ''
-    Write-Host 'ВАРИАНТ 1 — Claude Desktop на другом компьютере (твой случай: Linux)' -ForegroundColor Yellow
+    if ($viaTs) {
+        Write-Host 'ВАРИАНТ 1 — Claude Desktop на другом компьютере (через Tailscale)' -ForegroundColor Yellow
+        Write-Host "Адрес машины в tailnet: $clientIp — работает из любой сети, порт открывать не нужно."
+    } else {
+        Write-Host 'ВАРИАНТ 1 — Claude Desktop на другом компьютере (локальная сеть)' -ForegroundColor Yellow
+    }
     Write-Host 'На клиенте нужен mcp-proxy (pip install mcp-proxy), затем фрагмент для'
     Write-Host 'claude_desktop_config.json (Linux: ~/.config/Claude/claude_desktop_config.json):'
     Write-Host ''
     $blocks = @()
     foreach ($app in $script:Apps) {
+        $argItems = @('"--transport"', '"streamablehttp"')
+        if ($cfg.AuthToken) {
+            $argItems += @('"--headers"', '"Authorization"', ('"Bearer ' + $cfg.AuthToken + '"'))
+        }
+        $argItems += ('"http://' + $clientIp + ':' + $app.Port + '/mcp"')
         $lines = @(
             ('    "' + $app.Id + '": {'),
             '      "command": "/home/USER/.venvs/mcp-hub-client/bin/mcp-proxy",',
-            ('      "args": ["--transport", "streamablehttp", "http://' + $ip + ':' + $app.Port + '/mcp"]'),
+            ('      "args": [' + ($argItems -join ', ') + ']'),
             '    }'
         )
         $blocks += ($lines -join "`n")
@@ -510,13 +601,18 @@ function Invoke-Config {
 
     # --- firewall ---
     Write-Host ''
-    Write-Host 'FIREWALL (PowerShell от администратора, подставь IP клиента):' -ForegroundColor Yellow
+    if ($viaTs) {
+        Write-Host 'FIREWALL: для Tailscale ничего открывать не нужно — трафик идёт через туннель.' -ForegroundColor Green
+        Write-Host 'Правила ниже нужны только для подключения из обычной LAN (без Tailscale):' -ForegroundColor DarkGray
+    } else {
+        Write-Host 'FIREWALL (PowerShell от администратора, подставь IP клиента):' -ForegroundColor Yellow
+    }
     foreach ($app in $script:Apps) {
-        Write-Host ("  New-NetFirewallRule -DisplayName 'MCP $($app.Name)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $($app.Port) -RemoteAddress <CLIENT_IP> -Profile Private")
+        Write-Host ("  New-NetFirewallRule -DisplayName 'MCP $($app.Name)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $($app.Port) -RemoteAddress <CLIENT_IP> -Profile Private") -ForegroundColor DarkGray
     }
     Write-Host ''
-    Write-Host 'Не открывай порты всему интернету: прокси не аутентифицирует клиентов.'
-    Write-Host 'Для доступа извне LAN используй VPN.'
+    Write-Host 'Прокси проверяет Bearer-токен на каждом запросе; без токена (NoAuth) не выставляй'
+    Write-Host 'порты наружу — MCP-серверы выполняют код на этой машине.'
     Write-Host ''
 }
 
