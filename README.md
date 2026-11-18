@@ -286,6 +286,8 @@ Tailscale, файрвол Windows на порту 445 (готовая PowerShell
 
 | Симптом | Причина и лечение |
 |---------|-------------------|
+| Прокси Blender стартует минуту-две, mcp-hub раньше писал «не поднялся» | Первый запуск Blender-сервера грузит корпус документации API — mcp-hub теперь ждёт до 3 минут с прогрессом и пишет `OK (стартовал за N c)` |
+| Прокси упал: что случилось | Вывод прокси пишется в `logs/<app>-err.log` рядом с exe; при падении mcp-hub сам печатает хвост лога и запускает MCP-сервер напрямую, чтобы показать traceback |
 | comfy-mcp падает с ошибкой про `mcp` после установки mcp-proxy в то же окружение | Конфликт версий пакета `mcp` — держи серверы и прокси в **раздельных venv** (mcp-hub делает это сам) |
 | comfy-cli: `Bad git executable` / ImportError git | Не найден `git.exe` — поставь Git for Windows, путь подхватится автоматически |
 | Blender: кнопка запуска серая или ошибка «Online access must be enabled» | Edit → Preferences → System → Network → **Allow Online Access** |

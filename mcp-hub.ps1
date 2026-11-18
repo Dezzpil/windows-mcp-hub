@@ -102,7 +102,26 @@ $script:Apps = @(
         Env        = @{}
         Upstream   = @{ Kind = 'tcp'; Host = '127.0.0.1'; Port = 9876; Label = 'Blender addon' }
         Hint       = 'В Blender: Edit > Preferences > System > Network включи Allow Online Access, затем Add-ons > MCP > Start MCP Bridge Server (или включи Auto Start).'
-        PostSetup  = {}
+        PostSetup  = {
+            # Пакет ставится из git-поддиректории; если данные (data/prompts.yml)
+            # не доехали до site-packages, сервер падает на старте с
+            # FileNotFoundError. Проверяем и чиним сразу.
+            $py = Join-Path (Join-Path $cfg.BaseDir $app.Venv) 'Scripts\python.exe'
+            $check = "import blmcp, os; print(os.path.exists(os.path.join(os.path.dirname(blmcp.__file__), 'data', 'prompts.yml')))"
+            $ok = (& $py -c $check 2>$null | Out-String).Trim()
+            if ($ok -ne 'True') {
+                Write-Host '  Данные пакета (data/prompts.yml) не установились — переустанавливаю пакет...' -ForegroundColor Yellow
+                & $py -m pip install --force-reinstall --no-cache-dir $app.Packages
+                $ok = (& $py -c $check 2>$null | Out-String).Trim()
+            }
+            if ($ok -eq 'True') {
+                Write-Host '  Данные пакета на месте (data/prompts.yml)' -ForegroundColor Green
+            } else {
+                Write-Host '  ВАЖНО: data/prompts.yml отсутствует даже после переустановки.' -ForegroundColor Red
+                Write-Host '  MCP-сервер Blender будет падать на старте. Пришли лог logs\blender-err.log.' -ForegroundColor Yellow
+                $script:SetupErrors += "$($app.Name) (данные пакета)"
+            }
+        }
     }
 )
 
@@ -233,6 +252,63 @@ function Get-AppServerExe($app, $cfg) {
     foreach ($exe in $app.ServerExe) {
         $p = Join-Path $scripts $exe
         if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
+# Каталог логов прокси (рядом с exe/скриптом)
+function Get-HubLogDir {
+    $dir = Join-Path $ScriptDir 'logs'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    return $dir
+}
+
+# Последние строки лога (или $null, если файла нет/пуст)
+function Get-LogTail($path, $lines = 20) {
+    if (-not (Test-Path $path)) { return $null }
+    $tail = @(Get-Content $path -Tail $lines -ErrorAction SilentlyContinue | Where-Object { $_ -ne '' })
+    if ($tail.Count -eq 0) { return $null }
+    return ($tail -join "`n")
+}
+
+# Прямая проверка MCP-сервера: запуск с сразу закрытым stdin.
+# stdio-сервер при закрытом stdin завершается сам; если он падает на старте —
+# возвращается stderr с traceback. $null = не упал за таймаут (живёт).
+function Test-McpServerExe($exe, $timeoutSec = 10) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+    $p = $null
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $p.StandardInput.Close()
+        if (-not $p.WaitForExit($timeoutSec * 1000)) {
+            $p.Kill()
+            return $null
+        }
+        return $p.StandardError.ReadToEnd()
+    } catch {
+        return "Не удалось запустить $($exe): $($_.Exception.Message)"
+    } finally {
+        if ($p) { try { $p.Dispose() } catch {} }
+    }
+}
+
+# Подсказка по известным traceback-паттернам
+function Get-CrashHint($stderr) {
+    if (-not $stderr) { return $null }
+    if ($stderr -match 'prompts\.yml') {
+        return 'Пакет Blender Lab установлен без данных (data/prompts.yml). Запусти setup ещё раз — он проверит и переустановит пакет.'
+    }
+    if ($stderr -match 'ModuleNotFoundError') {
+        return 'Окружение сломано (нет модуля). Запусти setup ещё раз.'
+    }
+    if ($stderr -match 'Address already in use|10048') {
+        return 'Порт уже занят другим процессом.'
     }
     return $null
 }
@@ -432,24 +508,72 @@ function Invoke-Start {
         }
         Write-Host "  Запускаю mcp-proxy на ${bindHost}:$($app.Port) -> $serverExe"
 
+        # вывод прокси пишем в лог: при падении не придётся искать свернутое окно
+        $logDir = Get-HubLogDir
+        $errLog = Join-Path $logDir "$($app.Id)-err.log"
+        $outLog = Join-Path $logDir "$($app.Id)-out.log"
+
         $proc = Start-Process -FilePath $proxyExe `
             -ArgumentList (@('--host', $bindHost, '--port', "$($app.Port)") + $hostArgs + @('--pass-environment', '--', $serverExe)) `
-            -WindowStyle Minimized -PassThru
+            -WindowStyle Minimized -PassThru -RedirectStandardError $errLog -RedirectStandardOutput $outLog
 
-        # ждём порт
+        # ждём порт. Первый запуск MCP-сервера Blender может занять 1-2 минуты
+        # (грузит корпус документации API, антивирус сканирует свежие exe),
+        # поэтому ждём до 3 минут, а не 10 секунд.
         $ready = $false
-        for ($i = 0; $i -lt 20; $i++) {
+        $waitedSec = 0
+        for ($i = 1; $i -le 360; $i++) {
             Start-Sleep -Milliseconds 500
+            $waitedSec = [math]::Round($i / 2, 0)
             if (Get-PortOwnerPid -Port $app.Port) { $ready = $true; break }
             if ($proc.HasExited) { break }
+            if (($i % 20) -eq 0) {
+                Write-Host "  ...ещё стартует: ${waitedSec} c (первый запуск может занять 1-2 минуты)" -ForegroundColor DarkGray
+            }
         }
         if ($ready) {
-            Write-Host "  OK: http://$($cfg.ServerIp):$($app.Port)/mcp  (PID $($proc.Id))" -ForegroundColor Green
+            if ($waitedSec -gt 15) {
+                Write-Host "  OK (стартовал за ${waitedSec} c): http://$($cfg.ServerIp):$($app.Port)/mcp  (PID $($proc.Id))" -ForegroundColor Green
+            } else {
+                Write-Host "  OK: http://$($cfg.ServerIp):$($app.Port)/mcp  (PID $($proc.Id))" -ForegroundColor Green
+            }
             if ($cfg.TailscaleIp) {
                 Write-Host "      Tailscale: http://$($cfg.TailscaleIp):$($app.Port)/mcp" -ForegroundColor Green
             }
+        } elseif (-not $proc.HasExited) {
+            Write-Host "  Прокси ещё стартует (порт $($app.Port) пока не слушает)." -ForegroundColor Yellow
+            Write-Host "  Это нормально при первом запуске. Подожди минуту-другую и проверь:" -ForegroundColor Yellow
+            Write-Host "    .\mcp-hub.exe status" -ForegroundColor Yellow
+            Write-Host "  Лог прокси: $errLog" -ForegroundColor DarkGray
         } else {
-            Write-Host "  Прокси не поднялся на порту $($app.Port). Открой свернутое окно mcp-proxy и посмотри ошибки." -ForegroundColor Red
+            Write-Host "  Прокси не поднялся на порту $($app.Port)." -ForegroundColor Red
+
+            # 1) показываем хвост лога прокси прямо в консоли
+            $tail = Get-LogTail $errLog
+            if (-not $tail) { $tail = Get-LogTail $outLog }
+            if ($tail) {
+                Write-Host "`n  --- последние строки logs\$($app.Id)-err.log ---" -ForegroundColor DarkGray
+                Write-Host ($tail -split "`n" | ForEach-Object { '  ' + $_ })
+                Write-Host "  ---" -ForegroundColor DarkGray
+            } else {
+                Write-Host "  Лог пуст: logs\$($app.Id)-err.log" -ForegroundColor DarkGray
+            }
+
+            # 2) запускаем MCP-сервер напрямую: если он падает — покажем traceback
+            Write-Host "`n  Прямая проверка MCP-сервера (запуск без прокси)..."
+            $stderr = Test-McpServerExe $serverExe
+            if ($stderr) {
+                Write-Host "  MCP-сервер падает при запуске. Вывод ошибки:" -ForegroundColor Red
+                Write-Host ($stderr -split "`n" | Select-Object -First 25 | ForEach-Object { '  ' + $_ })
+                $hint = Get-CrashHint $stderr
+                if ($hint) { Write-Host "`n  Что делать: $hint" -ForegroundColor Yellow }
+            } elseif ($null -eq $stderr) {
+                Write-Host "  Сервер запускается и не падает — проблема в самом прокси или порту." -ForegroundColor Yellow
+                Write-Host "  Посмотри полный лог: $errLog" -ForegroundColor DarkGray
+            } else {
+                Write-Host "  Сервер стартует без ошибок (закрылся по EOF, как и должен)." -ForegroundColor Yellow
+                Write-Host "  Проблема, видимо, в прокси. Полный лог: $errLog" -ForegroundColor DarkGray
+            }
         }
     }
     Write-Host ''
