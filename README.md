@@ -88,8 +88,9 @@ python3 -m venv ~/.venvs/mcp-hub-client
 делать не нужно. mcp-hub сам определит tailnet-адрес при `start`, а
 `config` напечатает фрагмент уже с ним. Порт на роутере не
 открывается, трафик шифруется (WireGuard), каждый запрос проверяется
-по Bearer-токену. Подключение по MagicDNS-имени — впиши имя в
-`AllowedHosts` конфига.
+по Bearer-токену. Подключаться можно и по MagicDNS-имени машины —
+mcp-hub разрешает его автоматически (оно совпадает с именем
+компьютера в tailnet); другие имена добавляются через `AllowedHosts`.
 
 ### Шаг 5 (опционально). Шара референсов
 
@@ -215,6 +216,7 @@ New-NetFirewallRule -DisplayName 'SMB for Tailscale' -Direction Inbound -Action 
 | Blender: «Online access must be enabled» | Preferences → System → Network → **Allow Online Access** |
 | Два MCP-аддона ругаются на порт 9876 | Оставь только официальный Blender Lab |
 | Клиент получает 401/403 | Токен не совпадает — возьми свежий фрагмент из `config` |
+| Клиент получает 421 Misdirected Request | Клиент ходит по имени, которого нет в списке Host-заголовков прокси: MagicDNS-имя машины разрешается автоматически, другие — через `AllowedHosts` |
 | `mount error(112): Host is down` | Файрвол режет 445 (команда в выводе comfy-mount); попробуй `--vers 3.1.1` |
 | Шара не монтируется после перезагрузки | Используй строку fstab из вывода comfy-mount (`x-systemd.automount`) |
 | SmartScreen не даёт запустить exe | «Подробнее» → «Выполнить в любом случае», либо ps1-версия |

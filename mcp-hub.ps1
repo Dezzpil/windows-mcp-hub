@@ -495,6 +495,12 @@ function Invoke-Start {
             $bindHost = '0.0.0.0'
             $auths = @("$($cfg.ServerIp):$($app.Port)")
             if ($cfg.TailscaleIp) { $auths += "$($cfg.TailscaleIp):$($app.Port)" }
+            # MagicDNS-имя машины в tailnet совпадает с именем компьютера —
+            # разрешаем сразу, чтобы клиенты могли ходить по имени, а не по IP
+            # (иначе mcp-proxy отвечает 421 Misdirected Request)
+            if ($env:COMPUTERNAME) {
+                $auths += "$($env:COMPUTERNAME.ToLower()):$($app.Port)"
+            }
             if ($cfg.AllowedHosts) {
                 foreach ($h in $cfg.AllowedHosts) {
                     if ($h -match ':') { $auths += $h } else { $auths += "$($h):$($app.Port)" }
