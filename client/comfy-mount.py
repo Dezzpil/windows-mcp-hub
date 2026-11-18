@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-comfy-mount — подключение SMB-шары ComfyUI-Shared с Windows-машины (foucalt)
+comfy-mount — подключение SMB-шары ComfyUI-Shared с Windows-машины
 к Linux или macOS через Tailscale.
 
 Что делает:
@@ -27,7 +27,7 @@ import subprocess
 import sys
 
 # ----------------------------------------------------------------------------
-#  Значения по умолчанию (foucalt в tailnet, шара ComfyUI-Shared)
+#  Значения по умолчанию (шара ComfyUI-Shared; адрес подставь свой)
 # ----------------------------------------------------------------------------
 
 DEFAULTS = {
@@ -148,18 +148,18 @@ def check_tailscale(server):
     except subprocess.TimeoutExpired:
         fail("tailscale ping не ответил за 30 секунд",
              "Машина %s не отвечает." % server,
-             ["Проверь на foucalt, что Tailscale-клиент запущен и подключён.",
+             ["Проверь на Windows-машине, что Tailscale-клиент запущен и подключён.",
               "Выполни 'sudo tailscale up' и войди в тот же аккаунт.",
               "Проверь машину в консоли: https://console.tailscale.com/admin/machines",
-              "Если указано MagicDNS-имя (foucalt), включи MagicDNS в консоли Tailscale "
+              "Если указано MagicDNS-имя сервера, включи MagicDNS в консоли Tailscale "
               "или используй IP-адрес 100.x.y.z."])
     if r.returncode != 0:
         fail("Машина %s недоступна через Tailscale" % server,
              (r.stderr or r.stdout or "").strip() or "tailscale ping завершился с кодом %d" % r.returncode,
-             ["На foucalt: проверь, что Tailscale-клиент запущен (иконка в трее).",
+             ["На Windows-машине проверь, что Tailscale-клиент запущен (иконка в трее).",
               "Выполни 'tailscale status' — машина должна быть в списке и Online.",
               "Если машины нет в tailnet — подключи её: tailscale up + вход в аккаунт.",
-              "Если используешь имя foucalt, а не IP — включи MagicDNS в консоли Tailscale."])
+              "Если используешь MagicDNS-имя, а не IP — включи MagicDNS в консоли Tailscale."])
     out = (r.stdout or "").splitlines()
     pong = out[0] if out else "pong"
     ok("Tailscale-туннель работает: %s" % pong)
@@ -227,26 +227,26 @@ def _classify_smb_error(stderr):
 def _smb_fixes(kind, server, share):
     if kind == "auth":
         return ["Проверь имя пользователя и пароль (по умолчанию comfy/comfy).",
-                "Попробуй указать пользователя в виде foucalt\\comfy (--user 'foucalt\\\\comfy').",
+                "Попробуй указать пользователя вместе с машиной: --user '<ИМЯ_МАШИНЫ>\\<пользователь>'.",
                 "На Windows у локальной учётки comfy должен быть задан пароль "
                 "(учётки без пароля для сетевого доступа Windows не пускает).",
-                "Если на foucalt вход через аккаунт Microsoft — пароль SMB тот же, "
+                "Если на Windows-машине вход через аккаунт Microsoft — пароль SMB тот же, "
                 "что от учётной записи Microsoft."]
     if kind == "share":
-        return ["Проверь имя шары: на foucalt ПК правой кнопкой по папке → Свойства → "
+        return ["Проверь имя шары: на Windows-машине ПК правой кнопкой по папке → Свойства → "
                 "Доступ. Имя должно совпадать с '%s' (регистр не важен)." % share,
                 "Смотри шаг 2: возможно, шара называется иначе — укажи --share ИМЯ."]
     if kind == "network":
-        return ["На foucalt разреши SMB для tailnet — PowerShell от администратора:\n        %s" % FIREWALL_PS,
-                "Проверь, что на foucalt включён 'Общий доступ к файлам и принтерам' "
+        return ["На Windows-машине разреши SMB для tailnet — PowerShell от администратора:\n        %s" % FIREWALL_PS,
+                "Проверь, что на Windows-машине включён 'Общий доступ к файлам и принтерам' "
                 "(Параметры → Сеть → Дополнительные параметры сети).",
                 "Проверь сам туннель: tailscale ping %s с этой машины." % server]
     if kind == "protocol":
-        return ["На foucalt отключён SMBv2/v3? Включи: PowerShell (админ):\n"
+        return ["На Windows-машине отключён SMBv2/v3? Включи: PowerShell (админ):\n"
                 "        Set-SmbServerConfiguration -EnableSMB2Protocol $true",
                 "Попробуй другую версию: --vers 3.1.1 или --vers 2.1"]
     return ["Подробности смотри в сообщении выше.",
-            "На foucalt помогает перезапуск службы: Restart-Service LanmanServer"]
+            "На Windows-машине помогает перезапуск службы: Restart-Service LanmanServer"]
 
 def check_share_visible(server, user, cred_path):
     if SYS == "Linux":
