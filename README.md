@@ -7,13 +7,15 @@
 
 Сценарий, под который сделан инструмент: ComfyUI и Blender работают на
 Windows-компьютере с видеокартой, а Claude Desktop запущен на другом
-компьютере (например, на Linux) и подключается по локной сети.
+компьютере (например, на Linux) и подключается по локальной сети.
 
 ## Структура проекта
 
 ```text
 mcp-hub/
 ├── mcp-hub.ps1      # основной скрипт: вся логика + реестр приложений
+├── client/
+│   └── comfy-mount.py  # CLI для Linux/macOS: SMB-шара референсов через Tailscale
 ├── src/
 │   └── Program.cs   # C#-обёртка: упаковывает ps1 в один exe
 ├── assets/
@@ -138,36 +140,65 @@ python3 -m venv ~/.venvs/mcp-hub-client
 ```
 
 Фрагмент для `~/.config/Claude/claude_desktop_config.json` (пути
-подставь свои; точный вариант печатает `config`):
+подставь свои; точный вариант с реальным токеном печатает `config`):
 
 ```json
 {
   "mcpServers": {
     "comfyui": {
       "command": "/home/USER/.venvs/mcp-hub-client/bin/mcp-proxy",
-      "args": ["--transport", "streamablehttp", "http://192.168.1.50:8000/mcp"]
+      "args": ["--transport", "streamablehttp", "--headers", "Authorization", "Bearer <TOKEN>",
+               "http://192.168.1.50:8000/mcp"]
     },
     "blender": {
       "command": "/home/USER/.venvs/mcp-hub-client/bin/mcp-proxy",
-      "args": ["--transport", "streamablehttp", "http://192.168.1.50:8001/mcp"]
+      "args": ["--transport", "streamablehttp", "--headers", "Authorization", "Bearer <TOKEN>",
+               "http://192.168.1.50:8001/mcp"]
     }
   }
 }
 ```
 
+`<TOKEN>` — значение `AuthToken` из `mcp-hub.config.json` на
+Windows-машине. Если `NoAuth: true`, заголовки можно убрать.
+
 ## Firewall и безопасность
 
-Прокси **не аутентифицирует** клиентов. Открывай порты только для IP
-компьютера с Claude (PowerShell от администратора):
+Три линии защиты, изнутри наружу:
+
+1. **Bearer-токен.** Каждый входящий HTTP-запрос к прокси проверяется по
+   токену (генерируется автоматически при первом `start`, хранится в
+   `AuthToken` конфига). Клиент передаёт его в заголовке
+   `Authorization: Bearer <TOKEN>` — готовый фрагмент печатает `config`.
+   Токен лежит в `mcp-hub.config.json`, который в `.gitignore`.
+2. **Firewall Windows.** Порты 8000/8001 открывай только для IP клиента,
+   а 445 (SMB) — только для tailnet (PowerShell от администратора):
 
 ```powershell
+# MCP-порты — только компьютеру с Claude
 New-NetFirewallRule -DisplayName 'MCP ComfyUI' -Direction Inbound -Action Allow `
   -Protocol TCP -LocalPort 8000 -RemoteAddress <CLIENT_IP> -Profile Private
 New-NetFirewallRule -DisplayName 'MCP Blender' -Direction Inbound -Action Allow `
   -Protocol TCP -LocalPort 8001 -RemoteAddress <CLIENT_IP> -Profile Private
+
+# SMB (шара референсов) — только из tailnet
+New-NetFirewallRule -DisplayName 'SMB for Tailscale' -Direction Inbound -Action Allow `
+  -Protocol TCP -LocalPort 445 -RemoteAddress 100.64.0.0/10
 ```
 
-Для доступа извне домашней сети — VPN, а не открытые порты.
+3. **Tailscale.** Доступ извне домашней сети — только через tailnet
+   (WireGuard-шифрование, порт на роутере не открывается). См. раздел
+   «Доступ откуда угодно через Tailscale».
+
+Дополнительно:
+
+- у учётной записи Windows, под которой ходит SMB, должен быть
+  **нормальный пароль** — учётки без пароля сетевой доступ не проходят;
+- `"NoAuth": true` отключает проверку токена — не делай так, если прокси
+  доступен дальше доверенной сети: MCP-серверы (особенно Blender)
+  выполняют код на машине;
+- для отзыва доступа просто удали `AuthToken` из конфига и перезапусти
+  `start` — сгенерируется новый.
 
 ## Конфигурация
 
@@ -217,6 +248,52 @@ Bearer-токеном (клиентский mcp-proxy передаёт его в
 Отключить проверку токена можно ключом `"NoAuth": true` — но тогда не
 открывай прокси дальше доверенной сети: MCP-серверы (особенно Blender)
 выполняют код на машине.
+
+## Шара референсов по SMB: comfy-mount (Linux/macOS)
+
+Для генерации изображений по референсам клиенту нужен доступ к папке
+на Windows-машине. `client/comfy-mount.py` — однофайловая утилита на
+Python 3 (без зависимостей), которая подключает SMB-шару через
+Tailscale:
+
+```bash
+sudo python3 comfy-mount.py            # интерактивно, Enter оставляет значение по умолчанию
+sudo python3 comfy-mount.py --yes      # без вопросов
+sudo python3 comfy-mount.py --unmount  # отключить шару
+```
+
+Что делает:
+
+1. `tailscale ping` до сервера — проверяет туннель;
+2. сохраняет учётные данные в файл с правами 600
+   (Linux: `/etc/cifs-credentials`, macOS: `/etc/nsmb.conf`) — пароль
+   не светится в истории shell и в `ps`;
+3. проверяет видимость шары (`smbclient` / `smbutil`);
+4. монтирует шару с uid/gid твоего пользователя и показывает файлы.
+
+Каждая ошибка сопровождается диагнозом и способом лечения: недоступный
+Tailscale, файрвол Windows на порту 445 (готовая PowerShell-команда),
+неверный логин/пароль, опечатка в имени шары, отсутствие `cifs-utils`,
+проблемы версии SMB. В конце печатает готовую строку для `/etc/fstab`
+с `x-systemd.automount` — шара монтируется после перезагрузки при
+первом обращении, когда Tailscale уже поднят.
+
+Значения по умолчанию (адрес, имя шары, пользователь) заданы в начале
+файла в словаре `DEFAULTS` — поменяй под себя. Свои пароли в публичные
+репозитории не клади.
+
+## Диагностика
+
+| Симптом | Причина и лечение |
+|---------|-------------------|
+| comfy-mcp падает с ошибкой про `mcp` после установки mcp-proxy в то же окружение | Конфликт версий пакета `mcp` — держи серверы и прокси в **раздельных venv** (mcp-hub делает это сам) |
+| comfy-cli: `Bad git executable` / ImportError git | Не найден `git.exe` — поставь Git for Windows, путь подхватится автоматически |
+| Blender: кнопка запуска серая или ошибка «Online access must be enabled» | Edit → Preferences → System → Network → **Allow Online Access** |
+| Два аддона MCP в Blender ругаются на занятый порт 9876 | Оставь только официальный Blender Lab; community-аддон ahujasid использует тот же порт, но другой протокол |
+| Клиент получает 401/403 от прокси | Токен не совпадает: возьми свежий фрагмент из `mcp-hub.exe config` |
+| `mount error(112): Host is down` при монтировании шары | Файрвол Windows режет 445 — команда для правила в выводе comfy-mount; также попробуй `--vers 3.1.1` |
+| После перезагрузки Linux шара не смонтировалась | Используй строку fstab из вывода comfy-mount (с `x-systemd.automount`), а не статический mount |
+| SmartScreen не даёт запустить exe | «Подробнее» → «Выполнить в любом случае», либо используй ps1-версию |
 
 ## Как добавить новое приложение
 
@@ -272,6 +349,15 @@ sudo apt-get install -y mono-mcs
 
 ## Требования
 
+Сервер (Windows):
+
 - Windows 10/11, PowerShell 5.1 (встроен), .NET Framework 4.x (встроен).
-- Git for Windows (для comfy-cli).
+- Git for Windows (для comfy-cli и сервера Blender Lab).
 - Работающий ComfyUI / Blender — MCP лишь подключается к ним.
+
+Клиент (Linux/macOS):
+
+- Python 3 (для venv с `mcp-proxy` и для `comfy-mount.py`).
+- `cifs-utils` + `smbclient` (Linux) — для монтирования шары; на macOS
+  всё нужное встроено.
+- Tailscale — если нужен доступ вне домашней сети (и MCP, и SMB-шара).
