@@ -40,6 +40,11 @@ Claude Desktop — на другом компьютере (Linux/macOS), в до
 Не ставь community-аддон ahujasid (BlenderMCP) — тот же порт 9876, но
 другой протокол, с официальным несовместим.
 
+Хочешь использовать именно ahujasid (mcp-for-blender, есть премиум)?
+Поставь его аддон вместо официального и укажи в `mcp-hub.config.json`
+`"BlenderServer": "mcp-for-blender"` — setup поставит сервер с PyPI и
+аддон, `start` запустит его.
+
 ### Шаг 2. Запусти mcp-hub на Windows
 
 Двойной клик по `mcp-hub.exe` — авто-режим (установка → запуск →
@@ -173,6 +178,7 @@ powershell -ExecutionPolicy Bypass -File .\mcp-hub.ps1 setup
 | `AllowedHosts`  | доп. Host-авторитеты mcp-proxy (имена/IP, с портом или без)      |
 | `AuthToken`     | Bearer-токен (генерируется автоматически)                        |
 | `NoAuth`        | `true` — отключить проверку токена (не рекомендуется)            |
+| `BlenderServer` | `lab` (по умолчанию, официальный Blender Lab из git) или `mcp-for-blender` (PyPI, нужен его аддон) |
 
 ## Firewall и безопасность
 
@@ -214,7 +220,8 @@ New-NetFirewallRule -DisplayName 'SMB for Tailscale' -Direction Inbound -Action 
 | Ошибка про пакет `mcp` после установки mcp-proxy в окружение сервера | Конфликт версий — серверы и прокси в раздельных venv (mcp-hub делает это сам) |
 | comfy-cli: `Bad git executable` | Поставь Git for Windows, путь подхватится сам |
 | Blender: «Online access must be enabled» | Preferences → System → Network → **Allow Online Access** |
-| Два MCP-аддона ругаются на порт 9876 | Оставь только официальный Blender Lab |
+| Два MCP-аддона ругаются на порт 9876 | Оставь только один: официальный Blender Lab (`BlenderServer: "lab"`) или mcp-for-blender (`"mcp-for-blender"`) |
+| Blender: инструменты видны, но вызовы висят ~40 сек, в логе `Incomplete JSON response` | Сервер и аддон из разных миров: проверь `BlenderServer` в конфиге — он должен соответствовать включённому аддону. `setup blender` чинит сам |
 | Клиент получает 401/403 | Токен не совпадает — возьми свежий фрагмент из `config` |
 | Клиент получает 421 Misdirected Request | Клиент ходит по имени, которого нет в списке Host-заголовков прокси: MagicDNS-имя машины разрешается автоматически, другие — через `AllowedHosts` |
 | `mount error(112): Host is down` | Файрвол режет 445 (команда в выводе comfy-mount); попробуй `--vers 3.1.1` |

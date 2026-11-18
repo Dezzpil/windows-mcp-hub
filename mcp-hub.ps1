@@ -47,6 +47,8 @@ $script:Defaults = @{
     AllowedHosts   = @()     # дополнительные Host-авторитеты для mcp-proxy (имена/IP без порта или с портом)
     AuthToken      = ''      # Bearer-токен для входящих подключений; генерируется автоматически
     NoAuth         = $false  # $true = отключить проверку токена (не рекомендуется)
+    BlenderServer  = 'lab'   # 'lab' = официальный Blender Lab (из git, аддон из Blender 5.1+)
+                             # 'mcp-for-blender' = ahujasid с PyPI (нужен его аддон; есть премиум)
 }
 
 # ----------------------------------------------------------------------------
@@ -106,20 +108,32 @@ $script:Apps = @(
             # Пакет ставится из git-поддиректории; если данные (data/prompts.yml)
             # не доехали до site-packages, сервер падает на старте с
             # FileNotFoundError. Проверяем и чиним сразу.
+            # Отдельно ловим подмену: на PyPI есть чужой пакет с тем же именем
+            # 'blender-mcp' (ahujasid, он же mcp-for-blender). Он ставит тот же
+            # blender-mcp.exe, но говорит с аддоном на другом протоколе:
+            # tools/list работает, а вызовы инструментов висят по ~40 сек
+            # с "Incomplete JSON response received". Если он в venv — заменяем.
             $py = Join-Path (Join-Path $cfg.BaseDir $app.Venv) 'Scripts\python.exe'
+            & $py -c "import blender_mcp" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host '  Найден несовместимый пакет с PyPI (blender-mcp / mcp-for-blender) — заменяю на официальный Blender Lab...' -ForegroundColor Yellow
+                & $py -m pip uninstall -y blender-mcp 2>$null | Out-Null
+                & $py -m pip uninstall -y mcp-for-blender 2>$null | Out-Null
+                & $py -m pip install --no-cache-dir $app.Packages
+            }
             $check = "import blmcp, os; print(os.path.exists(os.path.join(os.path.dirname(blmcp.__file__), 'data', 'prompts.yml')))"
             $ok = (& $py -c $check 2>$null | Out-String).Trim()
             if ($ok -ne 'True') {
-                Write-Host '  Данные пакета (data/prompts.yml) не установились — переустанавливаю пакет...' -ForegroundColor Yellow
+                Write-Host '  Пакет Blender Lab установлен неверно — переустанавливаю...' -ForegroundColor Yellow
                 & $py -m pip install --force-reinstall --no-cache-dir $app.Packages
                 $ok = (& $py -c $check 2>$null | Out-String).Trim()
             }
             if ($ok -eq 'True') {
-                Write-Host '  Данные пакета на месте (data/prompts.yml)' -ForegroundColor Green
+                Write-Host '  Официальный сервер Blender Lab на месте (blmcp + data/prompts.yml)' -ForegroundColor Green
             } else {
-                Write-Host '  ВАЖНО: data/prompts.yml отсутствует даже после переустановки.' -ForegroundColor Red
-                Write-Host '  MCP-сервер Blender будет падать на старте. Пришли лог logs\blender-err.log.' -ForegroundColor Yellow
-                $script:SetupErrors += "$($app.Name) (данные пакета)"
+                Write-Host '  ВАЖНО: пакет Blender Lab не установился (git+https недоступен?).' -ForegroundColor Red
+                Write-Host '  Без него MCP-сервер Blender работать не будет. Пришли лог logs\blender-err.log.' -ForegroundColor Yellow
+                $script:SetupErrors += "$($app.Name) (пакет Blender Lab)"
             }
         }
     }
@@ -247,6 +261,49 @@ function Select-App($Name) {
     return $found
 }
 
+# Выбор MCP-сервера Blender (конфиг BlenderServer):
+#   'lab'            — официальный Blender Lab из git (аддон встроен в Blender 5.1+)
+#   'mcp-for-blender' — ahujasid с PyPI (нужен его аддон; есть премиум-функции)
+function Resolve-App($app, $cfg) {
+    if ($app.Id -ne 'blender' -or "$($cfg.BlenderServer)" -ne 'mcp-for-blender') { return $app }
+    $a = @{}
+    foreach ($k in $app.Keys) { $a[$k] = $app[$k] }
+    $a.Packages  = @('mcp-for-blender')
+    $a.ServerExe = @('mcp-for-blender.exe', 'blender-mcp.exe')
+    $a.NeedsGit  = $false
+    $a.Hint      = 'В Blender: выключи аддон Blender Lab (MCP Bridge) — он занимает тот же порт 9876,' +
+                   'затем в аддоне "MCP for Blender" запусти сервер.'
+    $a.PostSetup = {
+        # удаляем пакет 'blender-mcp' (deprecated-обёртка с PyPI и/или официальный
+        # Blender Lab — оба ставят blender-mcp.exe) и ставим актуальный mcp-for-blender
+        $py = Join-Path (Join-Path $cfg.BaseDir $app.Venv) 'Scripts\python.exe'
+        & $py -m pip uninstall -y blender-mcp 2>$null | Out-Null
+        & $py -c "import blender_mcp" 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '  Пакет mcp-for-blender не найден — переустанавливаю...' -ForegroundColor Yellow
+            & $py -m pip install --force-reinstall --no-cache-dir $app.Packages
+            & $py -c "import blender_mcp" 2>$null | Out-Null
+        }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host '  Пакет mcp-for-blender установлен' -ForegroundColor Green
+        } else {
+            Write-Host '  ВАЖНО: пакет mcp-for-blender не установился. Пришли вывод команды setup.' -ForegroundColor Red
+            $script:SetupErrors += "$($app.Name) (пакет mcp-for-blender)"
+        }
+        # аддон: копируем bundled/addon.py из пакета в каталог аддонов Blender
+        $exe = Get-AppServerExe $app $cfg
+        if ($exe) {
+            Write-Host '  Устанавливаю аддон mcp-for-blender в Blender...'
+            $null = & $exe install-addon 2>$null
+            Write-Host '  Если аддон не появился в Blender — скачай addon.py с' -ForegroundColor DarkGray
+            Write-Host '  https://github.com/ahujasid/mcp-for-blender и установи вручную.' -ForegroundColor DarkGray
+        }
+        Write-Host '  Дальше в Blender: выключи аддон Blender Lab (MCP Bridge, порт 9876),' -ForegroundColor Yellow
+        Write-Host '  перезапусти Blender, включи аддон "MCP for Blender" и запусти его сервер.' -ForegroundColor Yellow
+    }
+    return $a
+}
+
 function Get-AppServerExe($app, $cfg) {
     $scripts = Join-Path (Join-Path $cfg.BaseDir $app.Venv) 'Scripts'
     foreach ($exe in $app.ServerExe) {
@@ -301,6 +358,12 @@ function Test-McpServerExe($exe, $timeoutSec = 10) {
 # Подсказка по известным traceback-паттернам
 function Get-CrashHint($stderr) {
     if (-not $stderr) { return $null }
+    if ($stderr -match 'mcp-for-blender|blender-mcp is now') {
+        return 'В venv оказался пакет blender-mcp/mcp-for-blender с PyPI (ahujasid) вместо официального Blender Lab. Запусти setup blender — он заменит пакет. Либо осознанно переключись на него: BlenderServer = "mcp-for-blender" в mcp-hub.config.json + аддон mcp-for-blender в Blender.'
+    }
+    if ($stderr -match 'Incomplete JSON response') {
+        return 'MCP-сервер не может договориться с аддоном Blender: не тот сервер под аддон (см. BlenderServer в mcp-hub.config.json) или аддон не запущен. Запусти setup blender и проверь аддон в Blender.'
+    }
     if ($stderr -match 'prompts\.yml') {
         return 'Пакет Blender Lab установлен без данных (data/prompts.yml). Запусти setup ещё раз — он проверит и переустановит пакет.'
     }
@@ -359,7 +422,7 @@ function Invoke-Setup {
     if ($pythonOk) {
         Write-Host "`n[3/4] Создаю окружения в $($cfg.BaseDir)" -ForegroundColor Yellow
 
-        foreach ($app in $script:Apps) {
+        foreach ($app in ($script:Apps | ForEach-Object { Resolve-App $_ $cfg })) {
             Write-Host "`n  --- $($app.Name) ($($app.Venv)) ---" -ForegroundColor White
             if ($app.NeedsGit -and -not $script:GitOk) {
                 Write-Host '  Пропущено: для установки нужен Git for Windows (https://git-scm.com/install/windows).' -ForegroundColor Yellow
@@ -436,7 +499,7 @@ function Invoke-Setup {
 
 function Invoke-Start {
     $cfg = Read-HubConfig
-    $apps = Select-App $AppName
+    $apps = @(Select-App $AppName | ForEach-Object { Resolve-App $_ $cfg })
     $proxyExe = $null
     try { $proxyExe = Join-Path (Join-Path $cfg.BaseDir $script:ProxyVenv) 'Scripts\mcp-proxy.exe' } catch {}
     if (-not $proxyExe -or -not (Test-Path $proxyExe)) {
@@ -477,6 +540,21 @@ function Invoke-Start {
         if (-not $serverExe) {
             Write-Host "  MCP-сервер не найден в $($cfg.BaseDir)\$($app.Venv). Выполни: .\mcp-hub.ps1 setup" -ForegroundColor Red
             continue
+        }
+
+        # защита от подмены пакета (Blender + официальный Blender Lab):
+        # чужой 'blender-mcp' с PyPI ставит тот же exe, но несовместим с аддоном —
+        # tools/list работает, а вызовы инструментов висят по ~40 сек
+        if ($app.Id -eq 'blender' -and "$($cfg.BlenderServer)" -ne 'mcp-for-blender') {
+            $py = Join-Path (Join-Path $cfg.BaseDir $app.Venv) 'Scripts\python.exe'
+            if (Test-Path $py) {
+                & $py -c "import blender_mcp" 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host '  ВНИМАНИЕ: в venv стоит пакет blender-mcp/mcp-for-blender с PyPI (ahujasid),' -ForegroundColor Red
+                    Write-Host '  он несовместим с аддоном Blender Lab: список инструментов работает,' -ForegroundColor Red
+                    Write-Host '  но вызовы зависают на ~40 сек. Чинится командой: .\mcp-hub.ps1 setup blender' -ForegroundColor Yellow
+                }
+            }
         }
 
         # переменные окружения для дочернего MCP-сервера
